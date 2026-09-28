@@ -28,6 +28,11 @@ public class WorkloadRegistry {
         return workloads.containsKey(workloadId);
     }
 
+    /** 移除工作负载聚合（注销）。返回是否曾存在。 */
+    public boolean remove(String workloadId) {
+        return workloads.remove(workloadId) != null;
+    }
+
     public Optional<WorkloadAggregate> aggregate(String workloadId) {
         return Optional.ofNullable(workloads.get(workloadId));
     }

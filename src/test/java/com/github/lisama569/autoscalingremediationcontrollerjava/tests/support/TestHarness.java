@@ -1,6 +1,7 @@
 package com.github.lisama569.autoscalingremediationcontrollerjava.tests.support;
 
 import com.github.lisama569.autoscalingremediationcontrollerjava.autoscale.Autoscaler;
+import com.github.lisama569.autoscalingremediationcontrollerjava.capacity.CapacityPool;
 import com.github.lisama569.autoscalingremediationcontrollerjava.infra.SimulatedInfrastructure;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.ScalePolicy;
 import com.github.lisama569.autoscalingremediationcontrollerjava.orchestration.Controller;
@@ -22,13 +23,22 @@ public final class TestHarness {
     public final RemediationExecutor remediationExecutor;
     public final RemediationService remediationService;
     public final EventLog eventLog;
+    public final CapacityPool capacityPool;
     public final Controller controller;
 
     public TestHarness() {
-        this(30_000L);
+        this(30_000L, 1_000);
     }
 
     public TestHarness(long maxObservationAgeMillis) {
+        this(maxObservationAgeMillis, 1_000);
+    }
+
+    /**
+     * @param totalGlobalCapacity 全局共享实例总盘子；默认 1000 足够大，使原有单工作负载用例
+     *                            行为完全不变；多工作负载容量协作用例显式传小值。
+     */
+    public TestHarness(long maxObservationAgeMillis, int totalGlobalCapacity) {
         clock = new ManualClock(1_000L);
         registry = new WorkloadRegistry();
         observationStore = new ObservationStore(registry);
@@ -37,8 +47,9 @@ public final class TestHarness {
         eventLog = new EventLog();
         remediationExecutor = new RemediationExecutor(infra, clock, eventLog);
         remediationService = new RemediationService(registry, remediationExecutor, clock, eventLog);
+        capacityPool = new CapacityPool(totalGlobalCapacity);
         controller = new Controller(registry, observationStore, autoscaler, remediationService,
-                remediationExecutor, infra, clock, eventLog, maxObservationAgeMillis);
+                remediationExecutor, infra, clock, eventLog, maxObservationAgeMillis, capacityPool);
     }
 
     public void advance(long millis) {

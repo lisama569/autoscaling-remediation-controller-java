@@ -8,6 +8,8 @@ public enum RejectionReason {
     MISSING_POLICY,
     MISSING_LOAD_OBSERVATION,
     STALE_LOAD_OBSERVATION,
+    /** 扩容意向合法，但全局共享实例容量已满（或被 FIFO 队列前置等待者占用），本次未扩成。 */
+    INSUFFICIENT_GLOBAL_CAPACITY,
     COOLDOWN_ACTIVE,
     REMEDIATION_DISABLED,
     INSTANCE_NOT_FOUND,

@@ -8,6 +8,8 @@ import com.github.lisama569.autoscalingremediationcontrollerjava.model.ScalePoli
 import com.github.lisama569.autoscalingremediationcontrollerjava.store.WorkloadAggregate;
 import org.springframework.stereotype.Component;
 
+import java.util.function.LongFunction;
+
 /**
  * 目标副本数计算器（在调用方持有工作负载串行锁时执行）。
  *
@@ -30,6 +32,16 @@ public class Autoscaler {
     }
 
     public ScaleDecision evaluate(WorkloadAggregate agg, long nowMillis, long maxObservationAgeMillis) {
+        // 不经过共享容量闸门：申请一律视为成功（保持单工作负载历史调用方语义不变）
+        return evaluate(agg, nowMillis, maxObservationAgeMillis, ignored -> Boolean.TRUE);
+    }
+
+    /**
+     * @param capacityGate 扩容提交前申请 1 份全局共享额度；返回 true 表示已占用可扩，
+     *                     false 表示额度不足/前方有等待者（本次不提交任何状态，进入容量等待）
+     */
+    public ScaleDecision evaluate(WorkloadAggregate agg, long nowMillis, long maxObservationAgeMillis,
+                                  LongFunction<Boolean> capacityGate) {
         String wl = agg.getWorkloadId();
         ScalePolicy policy = agg.getPolicy();
         if (policy == null) {
@@ -95,6 +107,15 @@ public class Autoscaler {
             if (previous >= policy.maxReplicas()) {
                 return decision(wl, ScaleOutcome.NO_CHANGE, previous, previous, policy, load,
                         "scale-up desired but already at maxReplicas=" + policy.maxReplicas());
+            }
+            // 共享容量闸门：拿不到额度时不提交任何状态——desired 不变、冷却不刷新、
+            // 观测不被消费、streak 保留；后续由容量调度重新评估（结论与冷却/非法/缺失明确区分）。
+            if (!Boolean.TRUE.equals(capacityGate.apply(load.version()))) {
+                return new ScaleDecision(wl, ScaleOutcome.CAPACITY_PENDING, previous, previous,
+                        policy.version(), load.version(), RejectionReason.INSUFFICIENT_GLOBAL_CAPACITY,
+                        "scale-up desired (ratio " + ratio + ", upStreak " + agg.getUpStreak()
+                                + ") but global shared capacity exhausted or FIFO-waiters ahead; "
+                                + "replicas stay " + previous + ", queued for allocation");
             }
             int target = previous + 1;
             agg.setDesiredReplicas(target);

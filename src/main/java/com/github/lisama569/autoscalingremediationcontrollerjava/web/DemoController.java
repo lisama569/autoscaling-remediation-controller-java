@@ -1,5 +1,7 @@
 package com.github.lisama569.autoscalingremediationcontrollerjava.web;
 
+import com.github.lisama569.autoscalingremediationcontrollerjava.capacity.CapacityUnavailableException;
+import com.github.lisama569.autoscalingremediationcontrollerjava.model.CapacitySnapshot;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.HealthObservation;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.LoadObservation;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.ObservationAcceptResult;
@@ -9,12 +11,14 @@ import com.github.lisama569.autoscalingremediationcontrollerjava.model.ScaleDeci
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.ScalePolicy;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.WorkloadState;
 import com.github.lisama569.autoscalingremediationcontrollerjava.orchestration.Controller;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.LinkedHashMap;
@@ -45,6 +49,27 @@ public class DemoController {
                                         @RequestParam(defaultValue = "1") int replicas) {
         boolean created = controller.registerWorkload(workloadId, replicas);
         return Map.of("registered", created, "workloadId", workloadId);
+    }
+
+    /** 注册时全局容量不足：明确返回 409 与可区分原因，不留半成品。 */
+    @ExceptionHandler(CapacityUnavailableException.class)
+    @ResponseStatus(org.springframework.http.HttpStatus.CONFLICT)
+    public Map<String, Object> capacityUnavailable(CapacityUnavailableException e) {
+        return Map.of(
+                "registered", false,
+                "reason", "INSUFFICIENT_GLOBAL_CAPACITY",
+                "requested", e.requested(),
+                "available", e.available(),
+                "totalCapacity", e.totalCapacity(),
+                "message", e.getMessage());
+    }
+
+    /** 工作负载整体退出：退还全部共享额度，随后尝试满足排队中的其他工作负载。 */
+    @PostMapping("/workloads/{workloadId}/unregister")
+    public Map<String, Object> unregister(@PathVariable String workloadId) {
+        boolean removed = controller.unregisterWorkload(workloadId);
+        return Map.of("unregistered", removed, "workloadId", workloadId,
+                "capacity", controller.capacitySnapshot());
     }
 
     @PostMapping("/workloads/{workloadId}/policy")
@@ -86,6 +111,19 @@ public class DemoController {
     public Map<String, Object> tick() {
         List<String> transitions = controller.tickRemediations();
         return Map.of("transitions", transitions);
+    }
+
+    /** 显式驱动一次容量补额调度（FIFO），返回本轮实际补额（扩容）次数。 */
+    @PostMapping("/capacity/schedule")
+    public Map<String, Object> scheduleCapacity() {
+        int grants = controller.schedulePendingAllocations();
+        return Map.of("grantsThisRun", grants, "capacity", controller.capacitySnapshot());
+    }
+
+    /** 全局共享容量账本快照：总盘、已用、可用、各工作负载占用与 FIFO 等待队列。 */
+    @GetMapping("/capacity")
+    public CapacitySnapshot capacity() {
+        return controller.capacitySnapshot();
     }
 
     @GetMapping("/workloads/{workloadId}")

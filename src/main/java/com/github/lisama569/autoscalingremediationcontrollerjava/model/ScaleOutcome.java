@@ -9,5 +9,7 @@ public enum ScaleOutcome {
     SCALED_DOWN,
     NO_CHANGE,
     IN_COOLDOWN,
+    /** 扩容意向合法（区别于策略非法/观测缺失或过期/冷却中），但全局共享容量不足，已进入 FIFO 等待队列。 */
+    CAPACITY_PENDING,
     REJECTED
 }
