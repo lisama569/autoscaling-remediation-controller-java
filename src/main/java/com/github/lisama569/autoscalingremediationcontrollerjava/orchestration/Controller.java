@@ -2,6 +2,9 @@ package com.github.lisama569.autoscalingremediationcontrollerjava.orchestration;
 
 import com.github.lisama569.autoscalingremediationcontrollerjava.autoscale.Autoscaler;
 import com.github.lisama569.autoscalingremediationcontrollerjava.autoscale.PolicyValidator;
+import com.github.lisama569.autoscalingremediationcontrollerjava.capacity.CapacityReservation;
+import com.github.lisama569.autoscalingremediationcontrollerjava.capacity.CapacitySnapshot;
+import com.github.lisama569.autoscalingremediationcontrollerjava.capacity.SharedCapacityPool;
 import com.github.lisama569.autoscalingremediationcontrollerjava.infra.SimulatedInfrastructure;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.HealthObservation;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.Instance;
@@ -9,6 +12,7 @@ import com.github.lisama569.autoscalingremediationcontrollerjava.model.InstanceS
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.LoadObservation;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.ObservationAcceptResult;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.PolicyUpdateResult;
+import com.github.lisama569.autoscalingremediationcontrollerjava.model.RegistrationResult;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.RejectionReason;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.RemediationRequestOutcome;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.RemediationStatus;
@@ -51,9 +55,11 @@ public class Controller {
     private final Clock clock;
     private final EventLog eventLog;
     private final long maxObservationAgeMillis;
+    private final SharedCapacityPool capacityPool;
 
     private final ConcurrentHashMap<String, Object> locks = new ConcurrentHashMap<>();
 
+    @org.springframework.beans.factory.annotation.Autowired
     public Controller(WorkloadRegistry registry,
                       ObservationStore observationStore,
                       Autoscaler autoscaler,
@@ -62,7 +68,8 @@ public class Controller {
                       SimulatedInfrastructure infra,
                       Clock clock,
                       EventLog eventLog,
-                      @Value("${arc.max-observation-age-millis:30000}") long maxObservationAgeMillis) {
+                      @Value("${arc.max-observation-age-millis:30000}") long maxObservationAgeMillis,
+                      SharedCapacityPool capacityPool) {
         this.registry = registry;
         this.observationStore = observationStore;
         this.autoscaler = autoscaler;
@@ -72,6 +79,7 @@ public class Controller {
         this.clock = clock;
         this.eventLog = eventLog;
         this.maxObservationAgeMillis = maxObservationAgeMillis;
+        this.capacityPool = capacityPool;
     }
 
     private Object lockOf(String workloadId) {
@@ -83,27 +91,157 @@ public class Controller {
     }
 
     /**
-     * 注册工作负载并创建初始副本（进程内实例）。重复注册幂等返回 false，不覆盖既有状态。
+     * 注册工作负载并创建初始副本（进程内实例）。初始实例同样占用全局共享容量；
+     * 容量不足时返回 {@link RejectionReason#SHARED_CAPACITY_EXHAUSTED}，不残留任何状态。
+     * 重复注册幂等返回 {@code registered=false}，不覆盖既有状态。
      */
-    public boolean registerWorkload(String workloadId, int initialReplicas) {
+    public RegistrationResult registerWorkload(String workloadId, int initialReplicas) {
         if (workloadId == null || workloadId.isBlank() || initialReplicas < 1) {
             throw new IllegalArgumentException("workloadId required and initialReplicas >= 1");
         }
         boolean created = registry.register(workloadId);
         if (!created) {
+            int existing = registry.aggregate(workloadId).orElseThrow().activeInstanceCount();
+            return RegistrationResult.alreadyExists(workloadId, existing);
+        }
+        synchronized (lockOf(workloadId)) {
+            long now = clock.nowMillis();
+            WorkloadAggregate agg = registry.aggregate(workloadId).orElseThrow();
+            // 初始实例同样从全局总盘占额度；不足则不创建任何实例并整体回滚注册
+            CapacityReservation reservation = capacityPool.reserveInitial(workloadId, initialReplicas);
+            if (!reservation.granted()) {
+                registry.unregister(workloadId);
+                locks.remove(workloadId);
+                String rationale = "cannot register: requested " + initialReplicas
+                        + " initial replicas but shared capacity only has "
+                        + (reservation.totalCapacity() - reservation.usedCapacity())
+                        + " free of " + reservation.totalCapacity();
+                eventLog.log(now, "register REJECT workload=" + workloadId
+                        + " reason=SHARED_CAPACITY_EXHAUSTED " + rationale);
+                return RegistrationResult.rejected(workloadId,
+                        RejectionReason.SHARED_CAPACITY_EXHAUSTED, rationale);
+            }
+            agg.setDesiredReplicas(initialReplicas);
+            for (int i = 1; i <= initialReplicas; i++) {
+                Instance instance = infra.provision(workloadId, agg.nextInstanceIndex(), now);
+                agg.instances().put(instance.getId(), instance);
+            }
+            eventLog.log(now, "register workload=" + workloadId
+                    + " initialReplicas=" + initialReplicas
+                    + " capacity(used/total)=" + reservation.usedCapacity() + "/"
+                    + reservation.totalCapacity());
+        }
+        return RegistrationResult.ok(workloadId, initialReplicas);
+    }
+
+    /**
+     * 工作负载整体退出：终止其全部活动实例、把占用额度退回总盘并移出等待队列，
+     * 随后按 FIFO 给之前因额度不足等待的工作负载补分配。
+     */
+    public boolean deregisterWorkload(String workloadId) {
+        long now = clock.nowMillis();
+        WorkloadAggregate agg = registry.aggregate(workloadId).orElse(null);
+        if (agg == null) {
             return false;
         }
         synchronized (lockOf(workloadId)) {
-            WorkloadAggregate agg = registry.aggregate(workloadId).orElseThrow();
-            agg.setDesiredReplicas(initialReplicas);
-            for (int i = 1; i <= initialReplicas; i++) {
-                Instance instance = infra.provision(workloadId, agg.nextInstanceIndex(), clock.nowMillis());
-                agg.instances().put(instance.getId(), instance);
+            int freed = 0;
+            for (Instance i : new ArrayList<>(agg.instances().values())) {
+                if (i.getStatus() != InstanceStatus.TERMINATED) {
+                    infra.terminate(i, now);
+                    freed++;
+                }
             }
-            eventLog.log(clock.nowMillis(), "register workload=" + workloadId
-                    + " initialReplicas=" + initialReplicas);
+            capacityPool.releaseAllAndRemove(workloadId);
+            registry.unregister(workloadId);
+            locks.remove(workloadId);
+            eventLog.log(now, "deregister workload=" + workloadId + " freedCapacity=" + freed
+                    + " capacity(used/total)=" + capacityPool.usedCapacity() + "/"
+                    + capacityPool.totalCapacity());
         }
+        reconcilePendingCapacity();
         return true;
+    }
+
+    /**
+     * 额度释放后按 FIFO 规则给等待中的工作负载补分配，返回本轮新授予的（工作负载, 份数）列表。
+     * 同一轮中每个工作负载一次只被授予 1 份然后回到队尾（轮转公平），直到无空闲额度或无等待者。
+     * 授予的额度立即落地为实例，保证账实一致。
+     */
+    public List<Map.Entry<String, Integer>> reconcilePendingCapacity() {
+        long now = clock.nowMillis();
+        List<Map.Entry<String, Integer>> grants = new ArrayList<>();
+        // 防止同一轮中队首在被授予 1 份后持续霸占额度：记录本轮已服务过的工作负载
+        java.util.Set<String> servedInPass = new java.util.HashSet<>();
+        // 硬上限：一次 drain 至多授予 totalCapacity 份（每轮都真实占用 1 份额度），杜绝活锁
+        int budget = capacityPool.totalCapacity();
+        while (budget-- > 0) {
+            String head = capacityPool.headWaiter();
+            if (head == null || capacityPool.availableCapacity() <= 0) {
+                break;
+            }
+            if (servedInPass.contains(head)) {
+                // 一轮轮转完成；再扫一遍以让仍在队首且仍有需求者继续（额度可能还有余）
+                servedInPass.clear();
+            }
+            WorkloadAggregate agg = registry.aggregate(head).orElse(null);
+            if (agg == null) {
+                capacityPool.releaseAllAndRemove(head);
+                continue;
+            }
+            synchronized (lockOf(head)) {
+                if (!grantOnePendingUnit(agg, now, grants)) {
+                    // 队首已无待满足需求但仍残留在队列：移除并继续处理下一个
+                    capacityPool.cancelWait(head);
+                    agg.setPendingCapacity(false);
+                    continue;
+                }
+                servedInPass.add(head);
+            }
+        }
+        if (!grants.isEmpty()) {
+            eventLog.log(now, "capacity drain grants=" + grants);
+        }
+        return grants;
+    }
+
+    /**
+     * 给等待中的工作负载落地 1 份额度。
+     *
+     * @return true=确实授予并落地了 1 份；false=该工作负载已无待满足额度
+     */
+    private boolean grantOnePendingUnit(WorkloadAggregate agg, long now,
+                                        List<Map.Entry<String, Integer>> grants) {
+        String wl = agg.getWorkloadId();
+        ScalePolicy policy = agg.getPolicy();
+        int granted = capacityPool.allocationOf(wl);
+        int ceiling = (policy == null) ? agg.getDesiredReplicas()
+                : Math.max(policy.minReplicas(), Math.min(policy.maxReplicas(), agg.getDesiredReplicas()));
+        if (granted >= ceiling) {
+            return false;
+        }
+        CapacityReservation reservation = capacityPool.requestScaleUpUnit(wl);
+        if (!reservation.granted()) {
+            return false;
+        }
+        agg.setDesiredReplicas(Math.min(ceiling, granted + 1));
+        provisionOne(agg, now);
+        agg.setLastScaleAtMillis(now);
+        boolean stillWaiting = capacityPool.isWaiting(wl);
+        agg.setPendingCapacity(stillWaiting);
+        grants.add(Map.entry(wl, 1));
+        String waitInfo = stillWaiting
+                ? " stillWaiting queuePosition=" + capacityPool.snapshot().waitingOrder().indexOf(wl)
+                : " queueLeft";
+        eventLog.log(now, "capacity GRANT workload=" + wl
+                + " replicas -> " + agg.activeInstanceCount()
+                + " capacity(used/total)=" + reservation.usedCapacity() + "/" + reservation.totalCapacity()
+                + waitInfo);
+        return true;
+    }
+
+    public CapacitySnapshot capacitySnapshot() {
+        return capacityPool.snapshot();
     }
 
     /** 校验并写入策略；版本回退拒绝；更新后立即把 desiredReplicas 钳制进新区间并落地。 */
@@ -220,7 +358,7 @@ public class Controller {
         }
     }
 
-    /** 计算目标副本数并立即把实例集合收敛到目标。 */
+    /** 计算目标副本数并立即把实例集合收敛到目标；缩容释放额度后触发 FIFO 补分配。 */
     public ScaleDecision reconcileScale(String workloadId) {
         long now = clock.nowMillis();
         WorkloadAggregate agg = registry.aggregate(workloadId).orElse(null);
@@ -228,25 +366,40 @@ public class Controller {
             return ScaleDecision.rejected(workloadId, RejectionReason.WORKLOAD_NOT_REGISTERED,
                     "workload not registered: " + workloadId, Long.MIN_VALUE, Long.MIN_VALUE);
         }
+        ScaleDecision decision;
+        int activeAfter;
         synchronized (lockOf(workloadId)) {
-            ScaleDecision decision = autoscaler.evaluate(agg, now, maxObservationAgeMillis);
+            decision = autoscaler.evaluate(agg, now, maxObservationAgeMillis);
             int activeBefore = agg.activeInstanceCount();
             applyDesiredReplicas(agg, now);
-            int activeAfter = agg.activeInstanceCount();
+            activeAfter = agg.activeInstanceCount();
             eventLog.log(now, "scale " + decision.outcome() + " workload=" + workloadId
                     + " replicas(active) " + activeBefore + " -> " + activeAfter
                     + " desired=" + agg.getDesiredReplicas()
                     + " policyV=" + decision.policyVersion() + " obsV=" + decision.observationVersion()
+                    + " capacity(used/total)=" + capacityPool.usedCapacity() + "/"
+                    + capacityPool.totalCapacity()
+                    + " waiting=" + capacityPool.waitingCount()
                     + " rationale=" + decision.rationale()
                     + (decision.rejectionReason() != null ? " reason=" + decision.rejectionReason() : ""));
-            return decision;
         }
+        // 锁外触发补分配：本次若是缩容（或策略变化）释放了额度，让等待者尽快收敛
+        if (capacityPool.waitingCount() > 0) {
+            reconcilePendingCapacity();
+        }
+        return decision;
     }
 
     /**
-     * 让实例数收敛到 desiredReplicas：
-     * 扩容直接创建；缩容优先回收无活动修复的 UNHEALTHY 实例，其次按创建顺序回收 READY 实例。
-     * 活动修复中的实例不会被回收（避免与修复竞争）。
+     * 让实例数收敛到 desiredReplicas。
+     *
+     * <p><b>额度语义：</b>扩容所需额度要么已由 Autoscaler（reconcile）预留，要么在此按
+     * {@link SharedCapacityPool#reserveOrQueue} 申请（策略抬高 minReplicas 等路径）；
+     * 额度已授予才创建实例，因此「Σ 活动实例数 ≤ 全局上限」恒成立。
+     * 缩容每回收一个实例就归还 1 份额度。
+     *
+     * <p>缩容优先回收无活动修复的 UNHEALTHY 实例，其次按创建顺序回收 READY 实例；
+     * 活动修复中的实例不会被回收（避免与修复竞争），此时缩容记录 scale-down BLOCKED。
      */
     private void applyDesiredReplicas(WorkloadAggregate agg, long now) {
         ScalePolicy policy = agg.getPolicy();
@@ -257,27 +410,53 @@ public class Controller {
         int desired = Math.max(policy.minReplicas(), Math.min(policy.maxReplicas(), agg.getDesiredReplicas()));
         agg.setDesiredReplicas(desired);
 
+        int granted = capacityPool.allocationOf(agg.getWorkloadId());
         while (active < desired) {
-            Instance instance = infra.provision(agg.getWorkloadId(), agg.nextInstanceIndex(), now);
-            agg.instances().put(instance.getId(), instance);
-            eventLog.log(now, "instance PROVISION " + instance.getId()
-                    + " workload=" + agg.getWorkloadId());
+            if (active >= granted) {
+                // 还没有为这一副本预留额度（策略抬底等非观测路径）：申请，不足则排队等待补分配
+                CapacityReservation r = capacityPool.reserveOrQueue(agg.getWorkloadId(), 1);
+                if (!r.granted()) {
+                    agg.setPendingCapacity(true);
+                    eventLog.log(now, "scale-up PENDING-CAPACITY workload=" + agg.getWorkloadId()
+                            + " active=" + active + " desired=" + desired
+                            + " queuePosition=" + r.queuePosition()
+                            + " capacity(used/total)=" + r.usedCapacity() + "/" + r.totalCapacity());
+                    break;
+                }
+                granted++;
+            }
+            provisionOne(agg, now);
             active++;
         }
         while (active > desired) {
             Instance victim = pickScaleDownVictim(agg);
             if (victim == null) {
+                // 剩余实例都在活动修复中，无法回收：额度也不能提前归还（实例仍真实占用），
+                // 等修复结束后的下一次收敛真正终止时再释放。
                 eventLog.log(now, "scale-down BLOCKED workload=" + agg.getWorkloadId()
                         + " active=" + active + " desired=" + desired
-                        + " all remaining instances are under active remediation");
+                        + " all remaining instances are under active remediation;"
+                        + " capacity stays reserved until termination");
                 break;
             }
             infra.terminate(victim, now);
             agg.instances().remove(victim.getId());
+            // 仅在实例真正终止的这一刻归还 1 份硬额度
+            capacityPool.release(agg.getWorkloadId(), 1);
             eventLog.log(now, "instance TERMINATE " + victim.getId()
-                    + " workload=" + agg.getWorkloadId() + " statusWas=" + victim.getStatus());
+                    + " workload=" + agg.getWorkloadId() + " statusWas=" + victim.getStatus()
+                    + " capacity(used/total)=" + capacityPool.usedCapacity() + "/"
+                    + capacityPool.totalCapacity());
             active--;
         }
+    }
+
+    /** 创建并登记一个实例（调用方必须已为该副本预留额度）。 */
+    private void provisionOne(WorkloadAggregate agg, long now) {
+        Instance instance = infra.provision(agg.getWorkloadId(), agg.nextInstanceIndex(), now);
+        agg.instances().put(instance.getId(), instance);
+        eventLog.log(now, "instance PROVISION " + instance.getId()
+                + " workload=" + agg.getWorkloadId());
     }
 
     private Instance pickScaleDownVictim(WorkloadAggregate agg) {
@@ -303,7 +482,10 @@ public class Controller {
     public List<String> tickRemediations() {
         long now = clock.nowMillis();
         List<String> transitions = new ArrayList<>();
-        for (WorkloadAggregate agg : registry.aggregates()) {
+        // 按 workloadId 排序后推进，保证多工作负载下处理顺序确定、可复现
+        List<WorkloadAggregate> ordered = new ArrayList<>(registry.aggregates());
+        ordered.sort(java.util.Comparator.comparing(WorkloadAggregate::getWorkloadId));
+        for (WorkloadAggregate agg : ordered) {
             synchronized (lockOf(agg.getWorkloadId())) {
                 List<RemediationTask> finished = remediationExecutor.tick(agg, now);
                 for (RemediationTask t : finished) {

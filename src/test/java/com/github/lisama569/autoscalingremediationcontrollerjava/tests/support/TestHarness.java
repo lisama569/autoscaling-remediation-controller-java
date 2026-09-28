@@ -1,6 +1,7 @@
 package com.github.lisama569.autoscalingremediationcontrollerjava.tests.support;
 
 import com.github.lisama569.autoscalingremediationcontrollerjava.autoscale.Autoscaler;
+import com.github.lisama569.autoscalingremediationcontrollerjava.capacity.SharedCapacityPool;
 import com.github.lisama569.autoscalingremediationcontrollerjava.infra.SimulatedInfrastructure;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.ScalePolicy;
 import com.github.lisama569.autoscalingremediationcontrollerjava.orchestration.Controller;
@@ -22,6 +23,7 @@ public final class TestHarness {
     public final RemediationExecutor remediationExecutor;
     public final RemediationService remediationService;
     public final EventLog eventLog;
+    public final SharedCapacityPool capacityPool;
     public final Controller controller;
 
     public TestHarness() {
@@ -29,16 +31,21 @@ public final class TestHarness {
     }
 
     public TestHarness(long maxObservationAgeMillis) {
+        this(maxObservationAgeMillis, 100_000);
+    }
+
+    public TestHarness(long maxObservationAgeMillis, int totalCapacity) {
         clock = new ManualClock(1_000L);
         registry = new WorkloadRegistry();
         observationStore = new ObservationStore(registry);
-        autoscaler = new Autoscaler();
+        capacityPool = new SharedCapacityPool(totalCapacity);
+        autoscaler = new Autoscaler(capacityPool);
         infra = new SimulatedInfrastructure();
         eventLog = new EventLog();
         remediationExecutor = new RemediationExecutor(infra, clock, eventLog);
         remediationService = new RemediationService(registry, remediationExecutor, clock, eventLog);
         controller = new Controller(registry, observationStore, autoscaler, remediationService,
-                remediationExecutor, infra, clock, eventLog, maxObservationAgeMillis);
+                remediationExecutor, infra, clock, eventLog, maxObservationAgeMillis, capacityPool);
     }
 
     public void advance(long millis) {

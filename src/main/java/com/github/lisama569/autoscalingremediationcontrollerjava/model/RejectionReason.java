@@ -16,5 +16,7 @@ public enum RejectionReason {
     REMEDIATION_CONCURRENCY_LIMIT,
     FAILURE_BUDGET_EXHAUSTED,
     REMEDIATION_COOLDOWN_ACTIVE,
+    /** 扩容意向合法，但全局共享实例容量已被其他工作负载占满（进入等待队列）。 */
+    SHARED_CAPACITY_EXHAUSTED,
     ILLEGAL_ARGUMENT
 }

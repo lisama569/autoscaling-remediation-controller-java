@@ -35,4 +35,9 @@ public class WorkloadRegistry {
     public Collection<WorkloadAggregate> aggregates() {
         return workloads.values();
     }
+
+    /** 移除工作负载聚合（工作负载整体退出）。@return true 表示此前存在。 */
+    public boolean unregister(String workloadId) {
+        return workloads.remove(workloadId) != null;
+    }
 }

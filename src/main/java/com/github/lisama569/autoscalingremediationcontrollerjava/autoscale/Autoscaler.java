@@ -1,11 +1,14 @@
 package com.github.lisama569.autoscalingremediationcontrollerjava.autoscale;
 
+import com.github.lisama569.autoscalingremediationcontrollerjava.capacity.CapacityGate;
+import com.github.lisama569.autoscalingremediationcontrollerjava.capacity.CapacityReservation;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.LoadObservation;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.RejectionReason;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.ScaleDecision;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.ScaleOutcome;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.ScalePolicy;
 import com.github.lisama569.autoscalingremediationcontrollerjava.store.WorkloadAggregate;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
@@ -25,8 +28,15 @@ import org.springframework.stereotype.Component;
 @Component
 public class Autoscaler {
 
+    private final CapacityGate capacityGate;
+
     public Autoscaler() {
-        // 判定时间由调用方显式传入，保证可测试
+        this(null);
+    }
+
+    @Autowired
+    public Autoscaler(CapacityGate capacityGate) {
+        this.capacityGate = capacityGate;
     }
 
     public ScaleDecision evaluate(WorkloadAggregate agg, long nowMillis, long maxObservationAgeMillis) {
@@ -52,6 +62,14 @@ public class Autoscaler {
         double ratio = load.loadRatio();
         boolean wantsUp = ratio > policy.scaleUpThreshold();
         boolean wantsDown = ratio <= policy.scaleDownThreshold();
+
+        // 一旦最新观测不再指向扩容（滞后带/明确缩容），此前“未满足的扩容需求”即作废：
+        // 退出 FIFO 队列并把目标收回到当前副本，避免 applyDesiredReplicas 又把它重新入队。
+        if (agg.isPendingCapacity() && !wantsUp && capacityGate != null) {
+            capacityGate.cancelWait(wl);
+            agg.setPendingCapacity(false);
+            agg.setDesiredReplicas(agg.activeInstanceCount());
+        }
 
         if (wantsUp) {
             agg.setUpStreak(agg.getUpStreak() + 1);
@@ -85,8 +103,10 @@ public class Autoscaler {
             }
         }
 
-        // 同一条观测（重复事件/重复调度）至多触发一次伸缩，防止重复扩容
-        if (load.version() == agg.getLastActedObservationVersion()) {
+        // 同一条观测（重复事件/重复调度）至多触发一次伸缩，防止重复扩容。
+        // 例外：已在容量队列中等待的工作负载，其意向尚未真正落地，重复评估应继续返回
+        // PENDING_CAPACITY（刷新等待），而不是被短路成 NO_CHANGE。
+        if (!agg.isPendingCapacity() && load.version() == agg.getLastActedObservationVersion()) {
             return decision(wl, ScaleOutcome.NO_CHANGE, previous, previous, policy, load,
                     "observation v" + load.version() + " already acted upon; duplicate event ignored");
         }
@@ -96,15 +116,46 @@ public class Autoscaler {
                 return decision(wl, ScaleOutcome.NO_CHANGE, previous, previous, policy, load,
                         "scale-up desired but already at maxReplicas=" + policy.maxReplicas());
             }
+            // 共享容量检查：意向合法、稳定与冷却都已通过，这里只差总盘额度
+            if (capacityGate != null) {
+                CapacityReservation reservation = capacityGate.requestScaleUpUnit(wl);
+                if (!reservation.granted()) {
+                    // 记录“未满足需求”：目标 +1（受 maxReplicas 钳制），但不占用额度、不创建实例。
+                    // 后续 drain 时按 desired - 已授予额度 逐份补足；lastScaleAt 也推进，
+                    // 因此等待期间不占冷却，额度一到即可落地。
+                    int wanted = Math.min(policy.maxReplicas(), previous + 1);
+                    agg.setDesiredReplicas(wanted);
+                    agg.setLastScaleAtMillis(nowMillis);
+                    agg.setLastActedObservationVersion(load.version());
+                    agg.setUpStreak(0);
+                    agg.setDownStreak(0);
+                    agg.setPendingCapacity(true);
+                    ScaleDecision pending = new ScaleDecision(wl, ScaleOutcome.PENDING_CAPACITY,
+                            previous, wanted, policy.version(), load.version(),
+                            RejectionReason.SHARED_CAPACITY_EXHAUSTED,
+                            "scale-up desired but shared capacity exhausted: used="
+                                    + reservation.usedCapacity() + "/" + reservation.totalCapacity()
+                                    + "; enqueued FIFO at position " + reservation.queuePosition()
+                                    + "; desired=" + wanted + " will be granted on release");
+                    return pending;
+                }
+            }
             int target = previous + 1;
             agg.setDesiredReplicas(target);
             agg.setLastScaleAtMillis(nowMillis);
             agg.setLastActedObservationVersion(load.version());
             agg.setUpStreak(0);
             agg.setDownStreak(0);
+            agg.setPendingCapacity(false);
             return decision(wl, ScaleOutcome.SCALED_UP, previous, target, policy, load,
                     "ratio " + ratio + " > upThreshold " + policy.scaleUpThreshold()
-                            + "; replicas " + previous + " -> " + target);
+                            + "; replicas " + previous + " -> " + target
+                            + (capacityGate != null ? "; capacity reserved" : ""));
+        }
+        // 走到缩容分支说明已不再需要扩容：若此前在排队，先取消等待，避免额度账与意向不一致
+        if (agg.isPendingCapacity() && capacityGate != null) {
+            capacityGate.cancelWait(wl);
+            agg.setPendingCapacity(false);
         }
         if (previous <= policy.minReplicas()) {
             return decision(wl, ScaleOutcome.NO_CHANGE, previous, previous, policy, load,

@@ -45,6 +45,9 @@ public final class WorkloadAggregate {
     /** 上一次真正引发伸缩动作的观测版本：同一条观测重复评估不得重复伸缩。 */
     private long lastActedObservationVersion = Long.MIN_VALUE;
 
+    /** 是否正在共享容量池的等待队列中（扩容意向合法但额度不足）。 */
+    private boolean pendingCapacity;
+
     private final LinkedHashMap<String, Instance> instances = new LinkedHashMap<>();
     private int instanceSequence;
 
@@ -139,6 +142,14 @@ public final class WorkloadAggregate {
 
     public void setLastActedObservationVersion(long v) {
         this.lastActedObservationVersion = v;
+    }
+
+    public boolean isPendingCapacity() {
+        return pendingCapacity;
+    }
+
+    public void setPendingCapacity(boolean pendingCapacity) {
+        this.pendingCapacity = pendingCapacity;
     }
 
     public LinkedHashMap<String, Instance> instances() {

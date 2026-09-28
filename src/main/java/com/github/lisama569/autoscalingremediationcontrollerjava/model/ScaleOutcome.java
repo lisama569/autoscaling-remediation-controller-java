@@ -9,5 +9,7 @@ public enum ScaleOutcome {
     SCALED_DOWN,
     NO_CHANGE,
     IN_COOLDOWN,
+    /** 伸缩意向合法且已通过稳定/冷却/去重判定，但共享容量不足，已进入等待队列。 */
+    PENDING_CAPACITY,
     REJECTED
 }

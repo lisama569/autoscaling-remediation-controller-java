@@ -4,6 +4,7 @@ import com.github.lisama569.autoscalingremediationcontrollerjava.model.HealthObs
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.LoadObservation;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.ObservationAcceptResult;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.PolicyUpdateResult;
+import com.github.lisama569.autoscalingremediationcontrollerjava.model.RegistrationResult;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.RemediationRequestOutcome;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.ScaleDecision;
 import com.github.lisama569.autoscalingremediationcontrollerjava.model.ScalePolicy;
@@ -41,10 +42,25 @@ public class DemoController {
     }
 
     @PostMapping("/workloads/{workloadId}")
-    public Map<String, Object> register(@PathVariable String workloadId,
-                                        @RequestParam(defaultValue = "1") int replicas) {
-        boolean created = controller.registerWorkload(workloadId, replicas);
-        return Map.of("registered", created, "workloadId", workloadId);
+    public RegistrationResult register(@PathVariable String workloadId,
+                                       @RequestParam(defaultValue = "1") int replicas) {
+        return controller.registerWorkload(workloadId, replicas);
+    }
+
+    @PostMapping("/workloads/{workloadId}/deregister")
+    public Map<String, Object> deregister(@PathVariable String workloadId) {
+        boolean removed = controller.deregisterWorkload(workloadId);
+        return Map.of("deregistered", removed, "workloadId", workloadId);
+    }
+
+    @PostMapping("/capacity/reconcile")
+    public Map<String, Object> reconcileCapacity() {
+        return Map.of("grants", controller.reconcilePendingCapacity());
+    }
+
+    @GetMapping("/capacity")
+    public Object capacity() {
+        return controller.capacitySnapshot();
     }
 
     @PostMapping("/workloads/{workloadId}/policy")
