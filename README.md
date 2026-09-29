@@ -13,7 +13,7 @@
 
 ```bash
 # JDK 21+，离线/联网均可
-mvn test                       # 运行全部 26 个确定性测试（核心验证方式）
+mvn test                       # 运行全部 34 个确定性测试（核心验证方式）
 mvn spring-boot:run            # 启动本地演示 HTTP 服务（默认 8080）
 ```
 
@@ -32,7 +32,7 @@ mvn spring-boot:run            # 启动本地演示 HTTP 服务（默认 8080）
 | --- | --- | --- |
 | POST | `/api/demo/workloads/{id}?replicas=2` | 注册工作负载并创建初始实例（占用共享容量；不足以 `SHARED_CAPACITY_EXHAUSTED` 拒绝；重复注册幂等） |
 | POST | `/api/demo/workloads/{id}/deregister` | 工作负载整体退出：终止实例、归还全部额度、移出等待队列并触发补分配 |
-| POST | `/api/demo/workloads/{id}/policy` | 写入策略（JSON 体为 ScalePolicy 字段） |
+| POST | `/api/demo/workloads/{id}/policy` | 写入策略（JSON 体为 ScalePolicy 字段）；下调上限等引发缩容时，释放的额度在本次操作内 FIFO 补分配 |
 | POST | `/api/demo/workloads/{id}/load?version=&ratio=&observedAt=` | 上报负载观测 |
 | POST | `/api/demo/workloads/{id}/health/{instanceId}?version=&healthy=` | 上报健康观测（不健康自动触发修复） |
 | POST | `/api/demo/workloads/{id}/reconcile` | 计算目标副本并收敛实例集合（缩容释放额度后自动 FIFO 补分配） |
@@ -103,26 +103,44 @@ mvn spring-boot:run            # 启动本地演示 HTTP 服务（默认 8080）
 等待期间：`desiredReplicas` 记为「已满足 + 未满足需求」，但**不占额度、不建实例**；
 不占用伸缩冷却（额度一到即可落地），也不会因重复调度重复扩容。
 
-### 3.3 分配规则：FIFO + 队首优先（确定、可解释、无饥饿）
+### 3.3 分配规则：FIFO + 队首优先 + 轮转补满（确定、可解释、无饥饿）
 
-- 额度不足的申请进入一条 **FIFO 等待队列**（同一工作负载至多占一个位置）。
+- 额度不足的申请进入一条 **FIFO 等待队列**（同一工作负载至多占一个位置；重复申请保持原位，
+  不会因重复评估被挪到队尾）。
 - **只要队首在等待，空闲额度只留给队首**，后来者即使有空余也不能插队——
+  一次性预留（策略抬 `minReplicas`）与单份申请（观测扩容）都遵守此规则，
   因此任何工作负载都不会被无限期饿死。
-- 补分配（drain）时每次只给队首授予 **1 份**，授予后若仍有需求则回到队尾，
-  形成**轮转公平**；直到无空闲额度或无等待者。一次 drain 有硬上限（`totalCapacity` 份），杜绝活锁。
-- 触发时机：任何**释放额度**的事件（缩容回收、工作负载退出）之后自动 drain；
-  也可用 `POST /api/demo/capacity/reconcile` 显式触发（对应后续调度）。
-- 等待者的扩容意向消失（观测进入滞后带/转为缩容/工作负载退出）时**立即让出队列**，
-  不做僵尸等待。
+- **补分配（drain）只授予队首，且每次 1 份**：授予后若该工作负载**仍有未满足需求**
+  （例如一次性欠两份、三份），它会带着剩余需求**回到队尾**，形成轮转公平；
+  drain 在同一次释放操作内持续轮转，**直到每个等待者都补到它的目标（`desiredReplicas`
+  钳进策略 `[min,max]` 的值）、或者总盘确实再无空闲为止**——只有后一种情况它才继续留在
+  队首等待下一次释放。这修复了「欠多份只补 1 份、剩余需求既不补也不排队」的漏分配：
+  等待者的 `desiredReplicas` 始终记录完整目标，授予 1 份后剩余份额继续保留在需求里。
+- **盘子空但队首仍有需求时，本轮立即停止并保留队首位置**（不会把它误判为已满足而踢出队列）；
+  队首若已无需求（意向撤销、被新策略钳低），则移出队列后继续服务下一个等待者，
+  僵尸队首不会永久挡住后来者。
+- 一次 drain 有硬上限（`2 × totalCapacity` 个迭代：每次要么真实授予 1 份、
+  要么移除一个永不复活的等待者、要么终止），杜绝活锁。
+- **触发时机：任何释放额度的事件都在该次操作内（锁外）自动 drain**——缩容回收、
+  工作负载退出，以及**改策略腾出额度**（下调 `maxReplicas` 引发缩容）；
+  也可用 `POST /api/demo/capacity/reconcile` 显式触发（手动补分配同样能把排队需求补到收敛）。
+- 等待者的扩容意向消失（观测进入滞后带/转为缩容/策略把目标压到已授予额度/工作负载退出）时
+  **立即让出队列**，不做僵尸等待。
 
 ### 3.4 额度回收与收敛
 
-- **缩容**：每回收一个实例立即归还 1 份，随后触发 FIFO 补分配。
+- **缩容**：每回收一个实例立即归还 1 份，**归还后在同一次 reconcile 内**触发 FIFO 补分配。
   活动修复中的实例不被回收（沿用既有 `scale-down BLOCKED` 规则），其额度在真正终止后才归还。
 - **工作负载退出**（`deregister`）：终止全部活动实例、归还全部已授予额度、移出等待队列，
-  然后让等待者补上。
-- 已授予额度与实例数最终收敛到一致：等待者在后续事件/调度中逐份补足，
-  最终各自 `活动实例数 == 已授予额度`，队列为空。
+  **同一次操作内**让等待者补上。
+- **改策略腾出额度**（如下调 `maxReplicas` / `minReplicas`）：策略写入先把
+  `desiredReplicas` 钳进新区间并终止多余实例、归还额度，**释放工作负载锁后立即 drain**——
+  排队等待的负载在**这一次策略写入内**就拿到刚释放的额度并收敛，不需要任何不相干的
+  后续操作把它「带出来」。
+- 已授予额度与实例数最终收敛到一致：等待者在当次释放事件中逐份轮转补足，
+  最终各自 `活动实例数 == 已授予额度 == 目标`，队列为空；
+  全局底线 `Σ 活动实例数 ≤ totalCapacity` 恒成立——授予只在「队首身份 + 确有空闲」同时
+  成立时发生，两个并发 drain 也不会超发（抢不到的一方立即停在 UNAVAILABLE，队首继续等）。
 
 ### 3.5 与冷却、阈值滞后、修复规则的配合
 
@@ -135,10 +153,14 @@ mvn spring-boot:run            # 启动本地演示 HTTP 服务（默认 8080）
 
 ### 3.6 确定性
 
-等待队列是有序数据结构，补分配严格按队首 + 轮转执行；`tick` 按工作负载 id 排序。
+等待队列是有序数据结构：补分配严格按队首授予、每份授予后才决定「回队尾轮转」还是「离队收敛」，
+无需求的队首按固定规则移除；`tick` 按工作负载 id 排序；**改策略释放额度也在同一操作内完成
+「释放 → drain」，不引入额外事件时序**。
 因此**同一条输入序列在全新环境重跑，谁先拿到、谁后拿到、各自最终收敛到多少完全一致**，
-不依赖线程抢跑（见 `SharedCapacityOrchestrationTest#sameInputSequenceYieldsSameAllocationAcrossRuns`）。
-并发测试只断言不变量（总数不超限、无重复/卡住任务），不依赖特定交错顺序。
+不依赖线程抢跑（见 `SharedCapacityOrchestrationTest#sameInputSequenceYieldsSameAllocationAcrossRuns`
+与 `SharedCapacityBackfillTest#backfillSequenceIsDeterministicAcrossRuns`）。
+并发抢最后一份额度的测试只断言不变量（总数不超限、无重复/卡住任务、无等待者永久滞留），
+不依赖特定交错顺序。
 
 
 ## 4. 状态迁移与不变量
@@ -178,7 +200,11 @@ mvn spring-boot:run            # 启动本地演示 HTTP 服务（默认 8080）
   观测写入、伸缩评估、修复请求与 `tick` 推进**全部串行化**；不同工作负载之间完全并行。
 - `SharedCapacityPool` 内部用一把全局锁原子记账。锁顺序固定为
   **「工作负载锁 → 容量锁」**（不存在反向获取），因此无锁顺序环、无死锁；
-  FIFO 补分配在工作负载锁之外逐把获取，避免嵌套多把工作负载锁。
+  缩容回收、工作负载退出、**策略写入**触发的 FIFO 补分配都在工作负载锁释放之后逐把获取，
+  drain 全程不嵌套任何工作负载锁。
+- drain 每轮只在池锁内做一次「队首身份 + 是否有空闲」的原子判定再授予：两个并发释放各自
+  触发的 drain 也不会把同一份额度授给两方，抢不到的一方立即停止本轮（`UNAVAILABLE`），
+  队首位置原样保留、等待下一次释放。
 - 因此在任意线程交错下：不会超额扩容（全局总盘 + 副本天花板 + 单观测单次动作 + 每轮 ±1）、
   不会漏扩容（每次合法意向都被 streak/冷却/容量规则确定处理，额度不足则排队并在回收后补上）、
   不会重复修复（活动任务去重）。
@@ -204,32 +230,52 @@ model/          ScalePolicy、观测、实例、修复任务、全部枚举与�
                  RejectionReason 增 SHARED_CAPACITY_EXHAUSTED)
 store/          WorkloadRegistry(含注销)、WorkloadAggregate(聚合根, pendingCapacity 标志)、
                 ObservationStore(版本治理)
-capacity/       SharedCapacityPool(全局额度账本 + FIFO 等待队列)、CapacityGate(扩容申请网关)、
-                CapacityReservation / CapacitySnapshot(结论与快照)
+capacity/       SharedCapacityPool(全局额度账本 + FIFO 等待队列；grantQueuedUnit 队首授予+轮转)、
+                CapacityGate(扩容申请网关)、CapacityReservation / CapacitySnapshot(结论与快照)
 autoscale/      PolicyValidator、Autoscaler(滞后带/稳定次数/冷却/单观测单次 + 共享容量判定)
 infra/          SimulatedInfrastructure(内存实例 + 脚本化修复结果)
 remediation/    RemediationService(请求校验)、RemediationExecutor(推进/超时/预算)
 orchestration/  Controller(分锁门面 + 注册占额/缩容归还/FIFO 补分配/退出)、EventLog、MainConfig
 web/            DemoController(本地 HTTP 演示，含 /capacity、/capacity/reconcile、deregister)
-tests/          6 个测试类共 26 个用例 + support/TestHarness
+tests/          7 个测试类共 34 个用例 + support/TestHarness
 ```
 
 容量相关测试：
 
-- `SharedCapacityPoolTest`（4 例）：账本占用/超发、FIFO 队首不被插队、释放与退出归还、确定性授予顺序。
-- `SharedCapacityOrchestrationTest`（8 例）：占满→等待→后来拿到、缩容/退出后 FIFO 重分配并收敛、
+- `SharedCapacityPoolTest`（6 例）：账本占用/超发、FIFO 队首不被插队、释放与退出归还、
+  确定性授予顺序、**重复申请不改变队列位置 / drain 授予后轮转回队尾 / 非队首不能靠一次性预留插队**。
+- `SharedCapacityOrchestrationTest`（9 例）：占满→等待→后来拿到、缩容/退出后 FIFO 重分配并收敛、
   超额注册被干净拒绝、多工作负载并发抢最后一份额度不超发、等待意向消失让出队列、
-  活动修复阻塞缩容时额度不提前释放、并发修复+伸缩混合无残留/卡住任务、同一输入序列重跑的确定性。
+  活动修复阻塞缩容时额度不提前释放、并发修复+伸缩混合无残留/卡住任务、同一输入序列重跑的确定性、
+  **多等待者轮转（欠多份每份回队尾）+ 僵尸队首（需求被策略钳掉）当场移出不挡路**。
+- `SharedCapacityBackfillTest`（5 例，本次回归）：
+  - **等待者一次性欠多份：一次释放后在同一操作内轮转补到目标并收敛**（欠 2 份/释放 2 份）；
+  - **部分释放只补 1 份时剩余需求继续排队，后续释放（含手动 `/capacity/reconcile`）继续补直到收敛**；
+  - **改策略下调 max 腾出的额度在同一次策略写入内当场授予等待者**；
+  - 多等待者轮转每负载每份轮转、盘子空时队首保留位置继续等；
+  - 同一条补分配输入序列重跑，授予先后/份数/队列顺序逐次一致。
 
 ## 8. 本地验证
 
 ```bash
-mvn test                                  # 全部 26 个确定性用例（核心验证）
+mvn test                                  # 全部 34 个确定性用例（核心验证）
 mvn -Dtest=SharedCapacityPoolTest test    # 只跑容量账本/FIFO 单测
-mvn -Dtest=SharedCapacityOrchestrationTest test  # 只跑多工作负载协同用例
+mvn -Dtest=SharedCapacityBackfillTest test
+                                          # 只跑「欠多份一次补到位/部分释放继续排队/改策略当场补」回归
+mvn -Dtest=SharedCapacityOrchestrationTest test  # 只跑多工作负载协同用例（含轮转/僵尸队首）
 mvn -Dtest=AutoscaleDeterminismTest,ObservationAndConcurrencyTest,EndToEndReproducibilityTest,RemediationTest test
                                           # 只跑原有单工作负载用例，确认不回归
 mvn spring-boot:run                       # HTTP 手工体验（默认 arc.total-capacity=100）
+```
+
+### 8.1 复现「欠多份只补一份」与「改策略腾额度不补」（修复前会失败）
+
+```bash
+# 场景一：b 策略抬 min=3 但盘子满（a=2,b=1,total=3，b 欠 2 份）；
+# a 退出释放 2 份后，b 必须在同一次操作内补到 3、队列清空。
+mvn -Dtest='SharedCapacityBackfillTest#waiterOwingMultipleUnitsIsFullyBackfilledOnSingleRelease' test
+# 场景二：a 下调 maxReplicas 缩出 1 份时，排队的 b 必须在同一次 policy 写入内拿到。
+mvn -Dtest='SharedCapacityBackfillTest#capacityFreedByPolicyTighteningIsGrantedToWaiterInSameOperation' test
 ```
 
 HTTP 快速体验共享容量（可在 `application.properties` 调小 `arc.total-capacity`）：

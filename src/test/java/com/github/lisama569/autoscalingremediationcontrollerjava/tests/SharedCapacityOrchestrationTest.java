@@ -353,6 +353,67 @@ class SharedCapacityOrchestrationTest {
                 + h.controller.capacitySnapshot().waitingOrder());
     }
 
+    /**
+     * 多等待者轮转：欠多份的队首每拿 1 份回队尾，其他等待者被轮流服务直到收敛；
+     * 队首的等待需求被新策略钳掉（下调 max 到已授予额度）时，它必须在同一次 drain 中被移出队列，
+     * 不能让一个已经无需求的僵尸队首残留在队列里。
+     */
+    @Test
+    void drainRotatesWaitersAndStaleHeadWithNoDemandIsRemoved() {
+        TestHarness h = new TestHarness(30_000L, 5);
+        h.controller.registerWorkload("a", 2);
+        h.controller.registerWorkload("b", 1);
+        h.controller.registerWorkload("c", 1); // 共 4
+        h.controller.updatePolicy("a", eagerPolicy(1L));
+        h.controller.updatePolicy("b", new ScalePolicy(1L, 3, 5, 0.8d, 0.5d, 1, 0L,
+                false, 1, 2, 10_000L, 300L, 1_000L)); // b 抬 min=3，欠 2 份
+        h.controller.updatePolicy("c", eagerPolicy(1L));
+        assertEquals(List.of("b"), h.controller.capacitySnapshot().waitingOrder());
+
+        // c 观测驱动再欠 1 份，排在 b 后面
+        pushHigh(h, "c", 1L);
+        assertEquals(ScaleOutcome.PENDING_CAPACITY, h.controller.reconcileScale("c").outcome());
+        assertEquals(List.of("b", "c"), h.controller.capacitySnapshot().waitingOrder());
+
+        // a 退出释放 2 份：drain 轮转服务队首 b（拿 1 回队尾）-> c（拿 1 离队）-> b 再拿第 2 份收敛
+        h.controller.deregisterWorkload("a");
+        assertEquals(3, h.controller.snapshot("b").instances().size(), "b backfilled to min=3");
+        assertEquals(2, h.controller.snapshot("c").instances().size(), "c served after rotating past b");
+        assertTrue(h.controller.capacitySnapshot().waitingOrder().isEmpty());
+        assertEquals(5, h.controller.capacitySnapshot().usedCapacity());
+        System.out.println("[shared] drain rotated b(2 units) and c(1 unit) to convergence");
+
+        // 僵尸队首场景：队首剩余需求被新策略钳掉，必须被移出队列而不是永久挡住后面
+        TestHarness h2 = new TestHarness(30_000L, 5);
+        h2.controller.registerWorkload("a", 2);
+        h2.controller.registerWorkload("b", 1);
+        h2.controller.registerWorkload("c", 1);
+        h2.controller.registerWorkload("d", 1); // 共 5，盘子满
+        h2.controller.updatePolicy("a", eagerPolicy(1L));
+        h2.controller.updatePolicy("b", new ScalePolicy(1L, 2, 3, 0.8d, 0.5d, 1, 0L,
+                false, 1, 2, 10_000L, 300L, 1_000L)); // b min=2：抬底的第 1 份拿不到 -> b 排队
+        h2.controller.updatePolicy("c", eagerPolicy(1L));
+        pushHigh(h2, "c", 1L); // c 想扩但队首是 b，不能插队 -> 排在 b 后
+        assertEquals(ScaleOutcome.PENDING_CAPACITY, h2.controller.reconcileScale("c").outcome());
+        assertEquals(List.of("b", "c"), h2.controller.capacitySnapshot().waitingOrder());
+
+        // b 的上限被钳到 1：活动 1 == 目标 1，无实例可终止、也无额度释放，但同一次操作的
+        // drain 必须把已无需求的僵尸队首 b 移出队列（不能永久挡住 c）。c 仍欠 1 份、盘子仍满。
+        h2.controller.updatePolicy("b", new ScalePolicy(2L, 1, 1, 0.8d, 0.5d, 1, 0L,
+                false, 1, 2, 10_000L, 300L, 1_000L));
+        assertEquals(1, h2.controller.snapshot("b").instances().size());
+        assertEquals(List.of("c"), h2.controller.capacitySnapshot().waitingOrder(),
+                "stale head must be removed and must not block later waiters");
+        assertEquals(5, h2.controller.capacitySnapshot().usedCapacity());
+
+        // d 退出释放 1 份：c 当场拿到并收敛（证明没被僵尸队首饿死）
+        h2.controller.deregisterWorkload("d");
+        assertEquals(2, h2.controller.snapshot("c").instances().size());
+        assertTrue(h2.controller.capacitySnapshot().waitingOrder().isEmpty());
+        assertEquals(5, h2.controller.capacitySnapshot().usedCapacity());
+        System.out.println("[shared] stale head b removed; c granted on next release, not starved");
+    }
+
     private static void await(CountDownLatch latch) {
         try {
             latch.await();

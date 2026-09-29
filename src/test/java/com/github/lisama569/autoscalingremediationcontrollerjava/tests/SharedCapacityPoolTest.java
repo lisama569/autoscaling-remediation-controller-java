@@ -102,4 +102,58 @@ class SharedCapacityPoolTest {
         assertTrue(pool.snapshot().waitingOrder().isEmpty());
         System.out.println("[pool] deterministic head-of-line grant order: " + grantOrder);
     }
+
+    /** 已在队列中的工作负载重复申请不得改变其 FIFO 位置（旧实现会把它挪到队尾）。 */
+    @Test
+    void repeatedRequestFromWaiterDoesNotMoveItsQueuePosition() {
+        SharedCapacityPool pool = new SharedCapacityPool(2);
+        pool.requestScaleUpUnit("a");
+        pool.requestScaleUpUnit("b"); // 满
+        assertFalse(pool.requestScaleUpUnit("a").granted());
+        assertFalse(pool.requestScaleUpUnit("b").granted()); // [a, b]
+        // a 重复申请（例如重复评估）：位置仍是 1，不能把自己挪到 b 后面，也不影响 b 的位置
+        CapacityReservation repeat = pool.requestScaleUpUnit("a");
+        assertFalse(repeat.granted());
+        assertEquals(1, repeat.queuePosition());
+        assertEquals(List.of("a", "b"), pool.snapshot().waitingOrder());
+
+        // drain 专用授予：队首 a 拿 1 份并要求轮转 -> 回到队尾，b 成为新队首
+        pool.release("b", 1);
+        CapacityReservation granted = pool.grantQueuedUnit("a", true);
+        assertTrue(granted.granted());
+        assertEquals(List.of("b", "a"), pool.snapshot().waitingOrder(),
+                "granted waiter with remaining demand rotates to the tail");
+        // 最后一份需求：不轮转，直接离队
+        pool.release("a", 1);
+        // b 先拿（队首），离队；再释放让 a 也能拿
+        CapacityReservation forB = pool.grantQueuedUnit("b", false);
+        assertTrue(forB.granted());
+        assertEquals(List.of("a"), pool.snapshot().waitingOrder());
+        System.out.println("[pool] repeat request preserves FIFO position; grant rotation works");
+    }
+
+    /** 非队首工作负载即便总盘有空余，也不能通过 reserveOrQueue 插队拿额度。 */
+    @Test
+    void reserveOrQueueRespectsHeadOfLineAndQueuedUnitGrantStopsWhenPoolEmpty() {
+        SharedCapacityPool pool = new SharedCapacityPool(3);
+        pool.reserveInitial("holder", 3); // 占满
+        assertFalse(pool.requestScaleUpUnit("a").granted()); // 队首等待者 a
+        pool.release("holder", 1); // 空余 1 份，队首仍是 a
+        // b 后来者：即使有空余也不能一次性预留，必须排在 a 后面
+        CapacityReservation b = pool.reserveOrQueue("b", 1);
+        assertFalse(b.granted());
+        assertEquals(2, b.queuePosition());
+        assertEquals(List.of("a", "b"), pool.snapshot().waitingOrder());
+
+        // drain：a 拿走唯一空余（轮转回队尾，因为测试让它仍有需求）
+        CapacityReservation g = pool.grantQueuedUnit("a", true);
+        assertTrue(g.granted());
+        assertEquals(3, pool.usedCapacity());
+        // 盘子再空时，队首 b 的授予尝试必须不授予且保持队首位置
+        CapacityReservation none = pool.grantQueuedUnit("b", false);
+        assertFalse(none.granted());
+        assertEquals(List.of("b", "a"), pool.snapshot().waitingOrder());
+        assertEquals("b", pool.headWaiter(), "b keeps head-of-line position while pool is empty");
+        System.out.println("[pool] non-head cannot jump queue; empty-pool grant keeps head waiting");
+    }
 }
