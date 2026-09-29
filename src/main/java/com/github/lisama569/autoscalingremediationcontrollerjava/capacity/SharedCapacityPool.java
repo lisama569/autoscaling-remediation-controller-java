@@ -156,6 +156,16 @@ public class SharedCapacityPool implements CapacityGate {
         waiters.remove(workloadId);
     }
 
+    /**
+     * 把仍有未满足需求的工作负载重新排到队尾（补分配轮转用）：
+     * 队首每被授予 1 份后若需求未尽，由调用方调用本方法将其移到队尾，
+     * 让其他等待者交替获得额度，直到它补到目标或额度耗尽（此时留在队列中继续等）。
+     * 不在队列中也允许调用（等价于入队队尾）。
+     */
+    public synchronized void requeue(String workloadId) {
+        enqueue(workloadId);
+    }
+
     /** 队首工作负载 id（无等待返回 null）。 */
     public synchronized String headWaiter() {
         return waiters.isEmpty() ? null : waiters.iterator().next();

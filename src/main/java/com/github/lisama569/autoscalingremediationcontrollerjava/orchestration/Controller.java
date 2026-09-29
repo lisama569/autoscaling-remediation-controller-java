@@ -165,14 +165,13 @@ public class Controller {
 
     /**
      * 额度释放后按 FIFO 规则给等待中的工作负载补分配，返回本轮新授予的（工作负载, 份数）列表。
-     * 同一轮中每个工作负载一次只被授予 1 份然后回到队尾（轮转公平），直到无空闲额度或无等待者。
+     * 同一轮中每个工作负载一次只被授予 1 份；若此后仍有未满足需求则回到队尾（轮转公平），
+     * 如此反复，直到它补到目标、或无空闲额度（留在队列继续等）、或无等待者。
      * 授予的额度立即落地为实例，保证账实一致。
      */
     public List<Map.Entry<String, Integer>> reconcilePendingCapacity() {
         long now = clock.nowMillis();
         List<Map.Entry<String, Integer>> grants = new ArrayList<>();
-        // 防止同一轮中队首在被授予 1 份后持续霸占额度：记录本轮已服务过的工作负载
-        java.util.Set<String> servedInPass = new java.util.HashSet<>();
         // 硬上限：一次 drain 至多授予 totalCapacity 份（每轮都真实占用 1 份额度），杜绝活锁
         int budget = capacityPool.totalCapacity();
         while (budget-- > 0) {
@@ -180,24 +179,24 @@ public class Controller {
             if (head == null || capacityPool.availableCapacity() <= 0) {
                 break;
             }
-            if (servedInPass.contains(head)) {
-                // 一轮轮转完成；再扫一遍以让仍在队首且仍有需求者继续（额度可能还有余）
-                servedInPass.clear();
-            }
             WorkloadAggregate agg = registry.aggregate(head).orElse(null);
             if (agg == null) {
                 capacityPool.releaseAllAndRemove(head);
                 continue;
             }
+            GrantResult result;
             synchronized (lockOf(head)) {
-                if (!grantOnePendingUnit(agg, now, grants)) {
-                    // 队首已无待满足需求但仍残留在队列：移除并继续处理下一个
-                    capacityPool.cancelWait(head);
-                    agg.setPendingCapacity(false);
-                    continue;
-                }
-                servedInPass.add(head);
+                result = grantOnePendingUnit(agg, now, grants);
             }
+            if (result == GrantResult.NO_DEMAND) {
+                // 队首已无待满足需求但仍残留在队列：移除并继续处理下一个
+                capacityPool.cancelWait(head);
+                agg.setPendingCapacity(false);
+            } else if (result == GrantResult.NO_CAPACITY) {
+                // 额度在检查与授予之间被并发注册等路径抢走：停止本轮，等待下次释放
+                break;
+            }
+            // GRANTED：若仍有需求，grantOnePendingUnit 已把它重新排到队尾，继续轮转
         }
         if (!grants.isEmpty()) {
             eventLog.log(now, "capacity drain grants=" + grants);
@@ -205,46 +204,68 @@ public class Controller {
         return grants;
     }
 
+    /** grantOnePendingUnit 的三种结论。 */
+    private enum GrantResult {
+        /** 确实授予并落地了 1 份。 */
+        GRANTED,
+        /** 该工作负载已无待满足额度（调用方应把它移出队列）。 */
+        NO_DEMAND,
+        /** 仍有需求但额度在竞争中被抢走（调用方应停止本轮 drain）。 */
+        NO_CAPACITY
+    }
+
     /**
      * 给等待中的工作负载落地 1 份额度。
      *
-     * @return true=确实授予并落地了 1 份；false=该工作负载已无待满足额度
+     * <p>授予后若该工作负载仍未补到目标（已授予额度 &lt; 需求上限），把它重新排到队尾：
+     * 欠多份额度的等待者会在同一轮/后续 drain 中按轮转继续拿，直到补到目标或额度耗尽；
+     * 同时 {@code desiredReplicas} 只升不降，需求记录不会因单次授予而被吞掉。
      */
-    private boolean grantOnePendingUnit(WorkloadAggregate agg, long now,
-                                        List<Map.Entry<String, Integer>> grants) {
+    private GrantResult grantOnePendingUnit(WorkloadAggregate agg, long now,
+                                            List<Map.Entry<String, Integer>> grants) {
         String wl = agg.getWorkloadId();
         ScalePolicy policy = agg.getPolicy();
         int granted = capacityPool.allocationOf(wl);
         int ceiling = (policy == null) ? agg.getDesiredReplicas()
                 : Math.max(policy.minReplicas(), Math.min(policy.maxReplicas(), agg.getDesiredReplicas()));
         if (granted >= ceiling) {
-            return false;
+            return GrantResult.NO_DEMAND;
         }
         CapacityReservation reservation = capacityPool.requestScaleUpUnit(wl);
         if (!reservation.granted()) {
-            return false;
+            return GrantResult.NO_CAPACITY;
         }
-        agg.setDesiredReplicas(Math.min(ceiling, granted + 1));
+        int newGranted = capacityPool.allocationOf(wl);
+        // desired 只升不降：至少要覆盖刚授予的额度，但保留此前记录的更高需求
+        agg.setDesiredReplicas(Math.min(ceiling, Math.max(agg.getDesiredReplicas(), newGranted)));
         provisionOne(agg, now);
         agg.setLastScaleAtMillis(now);
-        boolean stillWaiting = capacityPool.isWaiting(wl);
-        agg.setPendingCapacity(stillWaiting);
+        boolean stillNeeds = newGranted < ceiling;
+        if (stillNeeds) {
+            // 还欠额度：回到队尾继续轮转，绝不静默丢需求
+            capacityPool.requeue(wl);
+        }
+        agg.setPendingCapacity(stillNeeds);
         grants.add(Map.entry(wl, 1));
-        String waitInfo = stillWaiting
-                ? " stillWaiting queuePosition=" + capacityPool.snapshot().waitingOrder().indexOf(wl)
+        String waitInfo = stillNeeds
+                ? " stillWaiting(rotated) queuePosition=" + (capacityPool.snapshot().waitingOrder().indexOf(wl) + 1)
                 : " queueLeft";
         eventLog.log(now, "capacity GRANT workload=" + wl
                 + " replicas -> " + agg.activeInstanceCount()
                 + " capacity(used/total)=" + reservation.usedCapacity() + "/" + reservation.totalCapacity()
                 + waitInfo);
-        return true;
+        return GrantResult.GRANTED;
     }
 
     public CapacitySnapshot capacitySnapshot() {
         return capacityPool.snapshot();
     }
 
-    /** 校验并写入策略；版本回退拒绝；更新后立即把 desiredReplicas 钳制进新区间并落地。 */
+    /**
+     * 校验并写入策略；版本回退拒绝；更新后立即把 desiredReplicas 钳制进新区间并落地。
+     * 若本次变更释放了额度（如下调 maxReplicas 触发缩容），在返回前当场按 FIFO
+     * 给等待者补分配，不让刚腾出的额度闲置到下一个不相干操作。
+     */
     public PolicyUpdateResult updatePolicy(String workloadId, ScalePolicy policy) {
         long now = clock.nowMillis();
         WorkloadAggregate agg = registry.aggregate(workloadId).orElse(null);
@@ -252,6 +273,7 @@ public class Controller {
             return PolicyUpdateResult.reject(RejectionReason.WORKLOAD_NOT_REGISTERED,
                     "workload not registered: " + workloadId);
         }
+        PolicyUpdateResult result;
         synchronized (lockOf(workloadId)) {
             PolicyValidator.Validation validation = PolicyValidator.validate(policy);
             if (!validation.valid()) {
@@ -274,8 +296,13 @@ public class Controller {
                     + " desiredReplicas " + before + " -> " + clamped
                     + " min=" + policy.minReplicas() + " max=" + policy.maxReplicas());
             applyDesiredReplicas(agg, now);
-            return PolicyUpdateResult.ok(policy);
+            result = PolicyUpdateResult.ok(policy);
         }
+        // 锁外触发补分配：策略变更（如下调上限）缩容释放的额度，当场分给等待者并收敛
+        if (capacityPool.waitingCount() > 0) {
+            reconcilePendingCapacity();
+        }
+        return result;
     }
 
     public ObservationAcceptResult observeLoad(LoadObservation obs) {

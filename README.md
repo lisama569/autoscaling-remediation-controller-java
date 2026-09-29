@@ -13,7 +13,7 @@
 
 ```bash
 # JDK 21+，离线/联网均可
-mvn test                       # 运行全部 26 个确定性测试（核心验证方式）
+mvn test                       # 运行全部 30 个确定性测试（核心验证方式）
 mvn spring-boot:run            # 启动本地演示 HTTP 服务（默认 8080）
 ```
 
@@ -103,14 +103,21 @@ mvn spring-boot:run            # 启动本地演示 HTTP 服务（默认 8080）
 等待期间：`desiredReplicas` 记为「已满足 + 未满足需求」，但**不占额度、不建实例**；
 不占用伸缩冷却（额度一到即可落地），也不会因重复调度重复扩容。
 
-### 3.3 分配规则：FIFO + 队首优先（确定、可解释、无饥饿）
+### 3.3 分配规则：FIFO + 队首优先 + 轮转（确定、可解释、无饥饿）
 
-- 额度不足的申请进入一条 **FIFO 等待队列**（同一工作负载至多占一个位置）。
+- 额度不足的申请进入一条 **FIFO 等待队列**（同一工作负载至多占一个位置，
+  但它欠的额度可以不止 1 份——欠多少由 `desiredReplicas` 与已授予额度之差记录）。
 - **只要队首在等待，空闲额度只留给队首**，后来者即使有空余也不能插队——
   因此任何工作负载都不会被无限期饿死。
-- 补分配（drain）时每次只给队首授予 **1 份**，授予后若仍有需求则回到队尾，
-  形成**轮转公平**；直到无空闲额度或无等待者。一次 drain 有硬上限（`totalCapacity` 份），杜绝活锁。
-- 触发时机：任何**释放额度**的事件（缩容回收、工作负载退出）之后自动 drain；
+- 补分配（drain）时每次只给队首授予 **1 份**；授予后若它仍有未满足需求，
+  就**回到队尾继续轮转**（`SharedCapacityPool.requeue`），而不是离开队列。
+  如此反复，直到它**补到目标**、或**额度耗尽**（留在队列中继续等）、或无等待者。
+  欠多份额度的等待者因此会在同一轮/后续 drain 中逐份补齐，绝不静默丢需求；
+  等待期间 `desiredReplicas` 只升不降，需求记录不会被单次授予吞掉。
+  一次 drain 有硬上限（`totalCapacity` 份），杜绝活锁。
+- 触发时机：任何**释放额度**的事件之后自动 drain——缩容回收、工作负载退出，
+  以及**改策略腾额度**（如下调 `maxReplicas` 触发缩容）都会在本次操作返回前
+  当场完成补分配，等待者不需要等不相干的操作带出来；
   也可用 `POST /api/demo/capacity/reconcile` 显式触发（对应后续调度）。
 - 等待者的扩容意向消失（观测进入滞后带/转为缩容/工作负载退出）时**立即让出队列**，
   不做僵尸等待。
@@ -119,10 +126,13 @@ mvn spring-boot:run            # 启动本地演示 HTTP 服务（默认 8080）
 
 - **缩容**：每回收一个实例立即归还 1 份，随后触发 FIFO 补分配。
   活动修复中的实例不被回收（沿用既有 `scale-down BLOCKED` 规则），其额度在真正终止后才归还。
+- **改策略腾额度**：下调 `maxReplicas`（或 `minReplicas` 回落）使 `desiredReplicas` 被钳低时，
+  多余的实例当场回收、额度当场归还，并在**同一次 `updatePolicy` 调用内**完成等待者补分配。
 - **工作负载退出**（`deregister`）：终止全部活动实例、归还全部已授予额度、移出等待队列，
   然后让等待者补上。
-- 已授予额度与实例数最终收敛到一致：等待者在后续事件/调度中逐份补足，
-  最终各自 `活动实例数 == 已授予额度`，队列为空。
+- 已授予额度与实例数最终收敛到一致：等待者在释放发生的当次操作中逐份补足
+  （欠几份补几份，轮转进行），最终各自 `活动实例数 == 已授予额度`，队列为空；
+  额度不够补满时，差额部分继续留在队列里等下一次释放。
 
 ### 3.5 与冷却、阈值滞后、修复规则的配合
 
@@ -135,9 +145,11 @@ mvn spring-boot:run            # 启动本地演示 HTTP 服务（默认 8080）
 
 ### 3.6 确定性
 
-等待队列是有序数据结构，补分配严格按队首 + 轮转执行；`tick` 按工作负载 id 排序。
-因此**同一条输入序列在全新环境重跑，谁先拿到、谁后拿到、各自最终收敛到多少完全一致**，
-不依赖线程抢跑（见 `SharedCapacityOrchestrationTest#sameInputSequenceYieldsSameAllocationAcrossRuns`）。
+等待队列是有序数据结构，补分配严格按队首 + 轮转执行（每个等待者一次 1 份、
+需求未尽回队尾），`tick` 按工作负载 id 排序。因此**同一条输入序列在全新环境重跑，
+谁先拿到、谁后拿到、各自最终收敛到多少完全一致**，不依赖线程抢跑
+（见 `SharedCapacityOrchestrationTest#sameInputSequenceYieldsSameAllocationAcrossRuns`
+与 `SharedCapacityReallocationTest#multipleWaitersOwingSeveralUnitsRotateAndConvergeDeterministically`）。
 并发测试只断言不变量（总数不超限、无重复/卡住任务），不依赖特定交错顺序。
 
 
@@ -209,9 +221,9 @@ capacity/       SharedCapacityPool(全局额度账本 + FIFO 等待队列)、Cap
 autoscale/      PolicyValidator、Autoscaler(滞后带/稳定次数/冷却/单观测单次 + 共享容量判定)
 infra/          SimulatedInfrastructure(内存实例 + 脚本化修复结果)
 remediation/    RemediationService(请求校验)、RemediationExecutor(推进/超时/预算)
-orchestration/  Controller(分锁门面 + 注册占额/缩容归还/FIFO 补分配/退出)、EventLog、MainConfig
+orchestration/  Controller(分锁门面 + 注册占额/缩容归还/策略释放当场补分配/FIFO+轮转 drain/退出)、EventLog、MainConfig
 web/            DemoController(本地 HTTP 演示，含 /capacity、/capacity/reconcile、deregister)
-tests/          6 个测试类共 26 个用例 + support/TestHarness
+tests/          7 个测试类共 30 个用例 + support/TestHarness
 ```
 
 容量相关测试：
@@ -220,13 +232,17 @@ tests/          6 个测试类共 26 个用例 + support/TestHarness
 - `SharedCapacityOrchestrationTest`（8 例）：占满→等待→后来拿到、缩容/退出后 FIFO 重分配并收敛、
   超额注册被干净拒绝、多工作负载并发抢最后一份额度不超发、等待意向消失让出队列、
   活动修复阻塞缩容时额度不提前释放、并发修复+伸缩混合无残留/卡住任务、同一输入序列重跑的确定性。
+- `SharedCapacityReallocationTest`（4 例）：等待者欠多份时一次 drain 补到位并收敛、
+  部分释放时差额继续排队直至收敛、改策略腾出的额度当场分给等待者、
+  多等待者欠多份时 FIFO+轮转分配且重跑结果逐字节一致。
 
 ## 8. 本地验证
 
 ```bash
-mvn test                                  # 全部 26 个确定性用例（核心验证）
+mvn test                                  # 全部 30 个确定性用例（核心验证）
 mvn -Dtest=SharedCapacityPoolTest test    # 只跑容量账本/FIFO 单测
 mvn -Dtest=SharedCapacityOrchestrationTest test  # 只跑多工作负载协同用例
+mvn -Dtest=SharedCapacityReallocationTest test   # 只跑「欠多份补到位 / 改策略当场分额度」回归用例
 mvn -Dtest=AutoscaleDeterminismTest,ObservationAndConcurrencyTest,EndToEndReproducibilityTest,RemediationTest test
                                           # 只跑原有单工作负载用例，确认不回归
 mvn spring-boot:run                       # HTTP 手工体验（默认 arc.total-capacity=100）
